@@ -22,8 +22,8 @@ jobs:
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     env:
-      BIN_TARGET: gemini2api-rs    # 实际 Cargo bin 名（你的项目里存在）
-      OUT_NAME: gemini2api         # 打包后对外展示的文件名
+      BIN_TARGET: duckai-cli    # 实际 Cargo bin 名（你的项目里存在）
+      OUT_NAME: duckai-cli         # 打包后对外展示的文件名
     strategy:
       fail-fast: false
       matrix:
