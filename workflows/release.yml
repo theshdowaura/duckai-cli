@@ -1,0 +1,154 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to release (e.g. v1.2.3)'
+        required: true
+      create_tag:
+        description: 'Create the tag if it does not exist'
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    env:
+      BIN_TARGET: gemini2api-rs    # 实际 Cargo bin 名（你的项目里存在）
+      OUT_NAME: gemini2api         # 打包后对外展示的文件名
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            archive: tar.gz
+          - os: macos-13
+            target: x86_64-apple-darwin
+            archive: tar.gz
+          - os: macos-14
+            target: aarch64-apple-darwin
+            archive: tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+          - os: windows-latest
+            target: aarch64-pc-windows-msvc
+            archive: zip
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install Linux cross toolchain (aarch64)
+        if: runner.os == 'Linux' && matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          mkdir -p ~/.cargo
+          cat >> ~/.cargo/config.toml <<'EOF'
+          [target.aarch64-unknown-linux-gnu]
+          linker = "aarch64-linux-gnu-gcc"
+          EOF
+
+      - name: Build
+        run: cargo build --locked --release --target ${{ matrix.target }} --bin ${{ env.BIN_TARGET }}
+
+      - name: Package binary (Unix)
+        if: matrix.archive == 'tar.gz'
+        run: |
+          binary_src="target/${{ matrix.target }}/release/${{ env.BIN_TARGET }}"
+          test -f "$binary_src" || { echo "Binary not found at $binary_src"; ls -R target || true; exit 1; }
+          output="${{ env.OUT_NAME }}-${{ matrix.target }}.${{ matrix.archive }}"
+          mkdir -p package
+          cp "$binary_src" "package/${{ env.OUT_NAME }}"
+          tar czf "$output" -C package "${{ env.OUT_NAME }}"
+          echo "PACKAGE_NAME=$(basename "$output")" >> "$GITHUB_ENV"
+          echo "PACKAGE_PATH=$output" >> "$GITHUB_ENV"
+
+      - name: Package binary (Windows)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $binarySrc = "target/${{ matrix.target }}/release/$Env:BIN_TARGET.exe"
+          if (!(Test-Path $binarySrc)) {
+            Write-Host "Binary not found at $binarySrc"
+            Get-ChildItem -Recurse target | Out-String | Write-Host
+            exit 1
+          }
+          $output = "${{ env.OUT_NAME }}-${{ matrix.target }}.${{ matrix.archive }}"
+          New-Item -ItemType Directory -Path "package" -Force | Out-Null
+          Copy-Item $binarySrc "package/${{ env.OUT_NAME }}.exe"
+          Compress-Archive -Path "package/${{ env.OUT_NAME }}.exe" -DestinationPath $output -Force
+          "PACKAGE_NAME=$output" | Out-File -FilePath $Env:GITHUB_ENV -Encoding utf8 -Append
+          "PACKAGE_PATH=$output" | Out-File -FilePath $Env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PACKAGE_NAME }}
+          path: ${{ env.PACKAGE_PATH }}
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (fetch all for tags)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # 手动触发时确保 tag 存在（必要时创建）
+      - name: Ensure tag exists for manual dispatch
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          TAG_NAME: ${{ inputs.tag }}
+        run: |
+          git fetch --tags
+          if git rev-parse -q --verify "refs/tags/${TAG_NAME}"; then
+            echo "Tag ${TAG_NAME} already exists."
+          else
+            if [ "${{ inputs.create_tag }}" = "true" ]; then
+              git config user.name "github-actions[bot]"
+              git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+              # 将 tag 打在当前 HEAD 上；如需指定提交，可在触发时改为先 checkout
+              git tag -a "${TAG_NAME}" -m "${TAG_NAME}"
+              git push origin "${TAG_NAME}"
+            else
+              echo "Tag ${TAG_NAME} does not exist and create_tag=false"; exit 1
+            fi
+          fi
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          # tag push 触发时：使用当前 ref 的 tag；手动触发时：使用输入的 tag
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || inputs.tag }}
+          files: release-assets/**
+          generate_release_notes: true
+          overwrite_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
